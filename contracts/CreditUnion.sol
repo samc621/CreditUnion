@@ -1,106 +1,112 @@
-pragma solidity ^0.4.17;
+pragma solidity ^0.4.23;
 
 contract CreditUnion {
     struct Account {
-        address memberID;
         uint currentBalance;
         uint availableBalance;
-        uint startTime;
+        uint startTime; //Timestamp
+        uint lastCompoundBlockNumber;
     }
     mapping(address => Account) public members;
+    mapping(uint => address) public memberIDs;
     uint public membersCount;
 
     struct Loan {
-        uint loanID;
-        uint beginTime;
-        uint loanTime;
+        uint beginTime; //Timestamp
+        uint loanTime; //Days
         uint amountLoaned;
         bool paid;
     }
-    Loan[] public loans;
+    mapping(uint => Loan) public loans;
+    uint public loansCount;
 
     struct Transaction {
-        string category;
+        bytes32 category;
         uint amount;
         uint timestamp;
         uint balance;
     }
-    Transaction[] public transactions;
+    mapping(uint => Transaction) public transactions;
+    uint public transactionsCount;
 
-    uint private interestRate = 2;
-    uint private mostRecentCompound;
+    uint public APY; //interest rate earned on deposits
+    uint public interestRate; //interest rate paid on loans
 
-    modifier isMember() {
-        require(members[msg.sender].memberID == msg.sender);
+    uint public totalBalance;
+    uint public dividendsBalance;
+    uint public loanPayments;
+    uint public dividendPayouts;
+
+    modifier isMember(address sender) {
+        require(members[sender].startTime > 0);
         _;
     }
 
+    modifier isNotMember(address sender) {
+        require(members[sender].startTime == 0);
+        _;
+    }
+
+    constructor() public {
+        //set initial interest rates
+        APY = 5;
+        interestRate = 10;
+    }
+
     //should have some kind of DID piece (uPort)
-    function createAccount(address memberID) public {
-        members[msg.sender] = Account({
-            memberID: memberID,
-            currentBalance: 0,
-            availableBalance: 0,
-            startTime: now
-        });
+    function createAccount() public isNotMember(msg.sender) {
         membersCount++;
-        mostRecentCompound = now;
+        memberIDs[membersCount] = msg.sender;
+
+        members[msg.sender].currentBalance = 0;
+        members[msg.sender].availableBalance = 0;
+        members[msg.sender].startTime = now;
+        members[msg.sender].lastCompoundBlockNumber = block.number;
+        
     }
     
     //msg.value is in wei, needs to be converted to ether on front-end
-    function deposit() public isMember payable {
-        members[msg.sender].currentBalance = members[msg.sender].currentBalance + msg.value;
-        members[msg.sender].availableBalance = members[msg.sender].availableBalance + msg.value;
-        
-        Transaction memory newTransaction = Transaction({
-            category: "Deposit",
-            amount: msg.value,
-            timestamp: now,
-            balance: members[msg.sender].currentBalance
-        });
-        transactions.push(newTransaction);        
+    function deposit() public isMember(msg.sender) payable {
+        members[msg.sender].currentBalance += msg.value;
+        members[msg.sender].availableBalance += msg.value;
+
+        addTransaction("Deposit", msg.value, msg.sender);
+        totalBalance += msg.value;        
     }
     
     //amount is in wei, needs to be converted to ether on front-end
-    function withdraw(uint amount) public isMember {
+    function withdraw(uint amount) public isMember(msg.sender) {
         require(amount <= members[msg.sender].availableBalance);
         msg.sender.transfer(amount);
-        members[msg.sender].currentBalance = members[msg.sender].currentBalance - amount;
-        members[msg.sender].availableBalance = members[msg.sender].availableBalance - amount;
+        members[msg.sender].currentBalance -= amount;
+        members[msg.sender].availableBalance -= amount;
         
-        Transaction memory newTransaction = Transaction({
-            category: "Withdrawal",
-            amount: amount,
-            timestamp: now,
-            balance: members[msg.sender].currentBalance
-        });
-        transactions.push(newTransaction);
+        addTransaction("Withdrawal", amount, msg.sender);   
+        totalBalance -= amount;
     }
 
     //msg.value is in wei, needs to be converted to ether on front-end
-    function transfer(address recipient) public isMember payable {
+    function transfer(address recipient) public isMember(msg.sender) payable {
         require(msg.value <= members[msg.sender].availableBalance);
         recipient.transfer(msg.value);
-        members[msg.sender].currentBalance = members[msg.sender].currentBalance - msg.value;
-        members[msg.sender].availableBalance = members[msg.sender].availableBalance - msg.value;
+        members[msg.sender].currentBalance -= msg.value;
+        members[msg.sender].availableBalance -= msg.value;
 
-        Transaction memory newTransaction = Transaction({
-            category: "Transfer",
-            amount: msg.value,
-            timestamp: now,
-            balance: members[msg.sender].currentBalance
-        });
-        transactions.push(newTransaction);
+        addTransaction("Transfer", msg.value, msg.sender);  
+        totalBalance -= msg.value; 
     }
 
-    function checkBalance() public isMember returns(uint[]) {
-        // write an algorithm that checks if it has been at least 1 day since the most recent compound.
-        // if it has, calculate how many days it has been, compound the balance "that" many times, and add the most recent time + "that" many days to set the new most recent time.
-        if (now - mostRecentCompound >= 1 seconds) {
-            var n = (now - mostRecentCompound)/1 seconds;
-            members[msg.sender].currentBalance = members[msg.sender].currentBalance * (1+interestRate/100)**n;
-            members[msg.sender].availableBalance = members[msg.sender].availableBalance * (1+interestRate/100)**n;
-            mostRecentCompound = mostRecentCompound + (n * 1 seconds);
+    //Compound the balance every 2,100,000 blocks (~1 year)
+    function checkBalance() public isMember(msg.sender) returns(uint[]) {
+        uint lastCompound = members[msg.sender].lastCompoundBlockNumber;
+        uint n = block.number - lastCompound;
+
+        if (n >= 2100000) {
+            uint interestPayment = members[msg.sender].currentBalance * (1+APY/100)**(n/2100000) - members[msg.sender].currentBalance;
+            totalBalance += members[msg.sender].currentBalance + interestPayment;
+            members[msg.sender].currentBalance += interestPayment;
+            members[msg.sender].availableBalance += interestPayment;
+            members[msg.sender].lastCompoundBlockNumber = block.number;
         }
 
         uint[] memory balances = new uint[](2);
@@ -110,53 +116,58 @@ contract CreditUnion {
     }
 
     //amountLoaned is in wei, needs to be converted to ether on front-end
-    function requestLoan(uint loanTime, uint amountLoaned) public isMember {
-        require(amountLoaned <= members[msg.sender].availableBalance);
-        msg.sender.transfer(amountLoaned);
-        members[msg.sender].availableBalance = members[msg.sender].availableBalance - amountLoaned;
-        
-        Loan memory newLoan = Loan({
-            loanID: loans.length + 1,
-            beginTime: now,
-            loanTime: loanTime,
-            amountLoaned: amountLoaned,
-            paid:false
-        });
-        loans.push(newLoan);
+    function requestLoan(uint _loanTime, uint _amountLoaned) public isMember(msg.sender) {
+        require(_amountLoaned <= members[msg.sender].availableBalance);
+        msg.sender.transfer(_amountLoaned);
+        members[msg.sender].availableBalance -= _amountLoaned;
 
-        Transaction memory newTransaction = Transaction({
-            category: "Loan Issued",
-            amount: amountLoaned,
-            timestamp: now,
-            balance: members[msg.sender].currentBalance
-        });
-        transactions.push(newTransaction);
+        loansCount++;
+
+        loans[loansCount].beginTime = now;
+        loans[loansCount].loanTime = _loanTime * 1 days;
+        loans[loansCount].amountLoaned = _amountLoaned;
+        loans[loansCount].paid = false;
+
+        addTransaction("Loan Issued", _amountLoaned, msg.sender);  
+        totalBalance -= _amountLoaned; 
     }
 
     //msg.value is in wei, needs to be converted to ether on front-end
-    //needs to add interest payment
-    function makePayment(uint loanID) public isMember payable {
-        require (msg.value == loans[loanID-1].amountLoaned);
-        members[msg.sender].availableBalance = members[msg.sender].availableBalance + loans[loanID-1].amountLoaned;
-        loans[loanID-1].paid = true;
+    function makePayment(uint loanID) public isMember(msg.sender) payable {
+        require (msg.value == loans[loanID].amountLoaned * (1+interestRate/100));
+        dividendsBalance += msg.value - loans[loanID].amountLoaned;
+        members[msg.sender].availableBalance += loans[loanID].amountLoaned;
+        loans[loanID].paid = true;
 
-        Transaction memory newTransaction = Transaction({
-            category: "Loan Repaid",
-            amount: loans[loanID-1].amountLoaned,
-            timestamp: now,
-            balance: members[msg.sender].currentBalance
-        });
-        transactions.push(newTransaction);
-    }
-
-    //users should be able to vote on adjusting the APY once each year
-    //vote weight depends on balance
-    function interestRateVote() public isMember {
+        addTransaction("Loan Repaid", msg.value, msg.sender);  
+        totalBalance += msg.value;
         
+        loanPayments++;
+        if (loanPayments % 20 == 0) {
+            payDividends();
+        } 
     }
 
-    //should pay net earnings on interest as a quarterly dividend to all members
-    function payDividend() public isMember {
+    //should pay dividends every 20 loan payments
+    //amount should depend on balance
+    function payDividends() internal {
+        uint totalBalance = totalBalance;
+        uint amount = dividendsBalance / membersCount;
+        for(uint i = 1; i <= membersCount; i++) {
+            uint shares = members[memberIDs[i]].currentBalance / totalBalance;
+            memberIDs[i].transfer(amount * shares);
+        }
 
+        dividendsBalance = 0;
+        dividendPayouts++;
+    }
+
+    function addTransaction(bytes32 _category, uint _amount, address sender) internal {
+        transactionsCount++;
+
+        transactions[transactionsCount].category = _category;
+        transactions[transactionsCount].amount = _amount;
+        transactions[transactionsCount].timestamp = now;
+        transactions[transactionsCount].balance = members[sender].currentBalance;
     }
 }
